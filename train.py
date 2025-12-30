@@ -12,7 +12,8 @@ from copy import deepcopy
 from datasets import load_dataset
 from reward_func import *
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+import torch.distributed as dist
+# os.environ['CUDA_VISIBLE_DEVICES'] = '2'  # 注释掉，使用分布式训练时不应限制GPU
 
 
 class GSM8KDataset(Dataset):
@@ -158,7 +159,9 @@ class GRPOTrainer:
                                     max_new_tokens = self.args.max_generate_length,
                                     temperature=0.9,
                                     top_p = 1,
-                                    top_k = 50)
+                                    top_k = 50,
+                                    pad_token_id=self.tokenizer.pad_token_id,
+                                    eos_token_id=self.tokenizer.eos_token_id)
                 
             if prompt_response_ids.size(1) >= max_length:
                 prompt_response_ids = prompt_response_ids[:, :max_length]
@@ -182,6 +185,9 @@ class GRPOTrainer:
                 response_length=action_mask.float().sum(dim=-1)
             )
             samples_list.append(samples)
+            
+            # 清理中间变量
+            del inputs, prompt_ids
 
         return samples_list
     
@@ -336,8 +342,12 @@ class GRPOTrainer:
             # scaler.step(optimizer)
             # scaler.update()
         
-            writer.add_scalar("grpo_loss", loss.item(), self.update_steps)
+            if writer is not None:  # 只在主进程记录
+                writer.add_scalar("grpo_loss", loss.item(), self.update_steps)
             print(f"step: {self.update_steps}/{self.global_steps}  grpo_loss: {loss.item():.8f}")
+        
+        # 释放中间变量
+        del loss
         torch.cuda.empty_cache()
 
     def train(self):
@@ -359,15 +369,19 @@ class GRPOTrainer:
                         if self.update_steps % self.args.save_steps == 0:
                             self.model.save_pretrained(self.args.output_dir + f'/checkpoint_{self.update_steps}')
                             self.tokenizer.save_pretrained(self.args.output_dir + f'/checkpoint_{self.update_steps}')
-                        
+                
+                # 清理缓存，防止内存泄漏
                 del inputs
+                torch.cuda.empty_cache()
     def save_model(self):
         self.model.save_pretrained(self.args.output_dir)
         self.tokenizer.save_pretrained(self.args.output_dir)           
 
 if __name__ == "__main__":
-    import os
-    os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+    # 初始化分布式训练
+    dist.init_process_group(backend='nccl')
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
     
     SYSTEM_PROMPT = """
 按照如下格式回答问题：
@@ -380,8 +394,11 @@ if __name__ == "__main__":
 """
     
     args = GRPOArguments()
+    args.device = f'cuda:{local_rank}'
     
-    writer = SummaryWriter('./runs')
+    # 只在主进程创建 tensorboard writer
+    writer = SummaryWriter('./runs') if local_rank == 0 else None
+    
     # 策略模型
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
