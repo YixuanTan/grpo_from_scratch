@@ -85,7 +85,9 @@ class GRPOTrainer:
             self.ref_model = deepcopy(model)
             self.ref_model.eval()
     
-        
+        # 只为训练模型启用梯度检查点
+        self.model.gradient_checkpointing_enable()
+
         if isinstance(tokenizer, str):
             tokenizer = AutoTokenizer.from_pretrained(tokenizer)
         
@@ -157,8 +159,9 @@ class GRPOTrainer:
             with torch.no_grad():
                 prompt_response_ids = self.model.generate(**inputs.to(self.args.device), 
                                     max_new_tokens = self.args.max_generate_length,
-                                    temperature=0.9,
-                                    top_p = 1,
+                                    do_sample=True,
+                                    temperature=1.0,  # 使用1.0避免数值不稳定
+                                    top_p = 0.9,  # 使用0.9而不是1以提高稳定性
                                     top_k = 50,
                                     pad_token_id=self.tokenizer.pad_token_id,
                                     eos_token_id=self.tokenizer.eos_token_id)
@@ -170,7 +173,13 @@ class GRPOTrainer:
           
             attention_mask = (prompt_response_ids.ne(self.tokenizer.pad_token_id)).to(dtype=torch.long)
             response_ids = prompt_response_ids[:, prompt_ids.size(1):]
-            action_mask = (response_ids.ne(self.tokenizer.eos_token_id) & response_ids.ne(self.tokenizer.pad_token_id)).to(dtype=torch.long)
+            # action_mask应该包含所有非padding的token（包括eos）
+            action_mask = response_ids.ne(self.tokenizer.pad_token_id).to(dtype=torch.long)
+            
+            # 如果action_mask全为0，设置至少一个位置为1（避免除零）
+            if action_mask.sum() == 0:
+                print("Warning: action_mask is all zeros, setting first position to 1")
+                action_mask[:, 0] = 1
         
 
             # 存储的是一个group的数据
@@ -260,11 +269,26 @@ class GRPOTrainer:
                 # rewards: [num_funcs, num_generations]
                 rewards = rewards.sum(dim=0) # shape: [num_generations]
                 print(f'rewards: {rewards}')
+                
+                # 检查rewards是否包含nan或inf
+                if torch.isnan(rewards).any() or torch.isinf(rewards).any():
+                    print(f"Warning: rewards contains nan or inf: {rewards}")
+                    rewards = torch.nan_to_num(rewards, nan=0.0, posinf=1.0, neginf=-1.0)
+                
                 mean_group_rewards = rewards.mean()
                 std_group_rewards = rewards.std()
                 
                 # GRPO的优势是句子粒度的，而非token粒度的
-                advantages = (rewards - mean_group_rewards) / (std_group_rewards + 1e-8) # shape: [num_generations]
+                # 添加更强的数值稳定性保护
+                if std_group_rewards < 1e-6:
+                    # 如果标准差太小，所有样本质量相近，设置优势为0
+                    advantages = torch.zeros_like(rewards)
+                    print(f"Warning: std too small ({std_group_rewards}), setting advantages to zero")
+                else:
+                    advantages = (rewards - mean_group_rewards) / (std_group_rewards + 1e-8) # shape: [num_generations]
+                    # 裁剪advantages避免极端值
+                    advantages = torch.clamp(advantages, -10.0, 10.0)
+                
                 batch_advantages.append(advantages)
         
                
@@ -288,16 +312,22 @@ class GRPOTrainer:
         if self.args.beta != 0.0:
             
             ref_action_log_probs = inputs['ref_action_log_probs']
-            log_ratio = ref_action_log_probs - action_log_probs 
+            log_ratio = ref_action_log_probs - action_log_probs
+            # 裁剪log_ratio避免exp溢出
+            log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
             log_ratio = log_ratio * action_mask
             
-            # k3: log_ratio.exp() - 1 - log_ratio
+            # k3: log_ratio.exp() - 1 - log_ratio (KL散度的近似)
             k3 = log_ratio.exp() - 1 - log_ratio
+            k3 = torch.clamp(k3, -100.0, 100.0)  # 裁剪k3避免极端值
         
         advantages = inputs['advantages']
         
         old_action_log_probs = inputs['old_action_log_probs'] if self.args.num_iterations > 1 else action_log_probs.detach()
-        coef_1 = torch.exp(action_log_probs - old_action_log_probs) # 重要性采样 shape: [batch_size * num_generations, num_actions]
+        
+        # 裁剪log概率差异避免exp溢出
+        log_ratio = torch.clamp(action_log_probs - old_action_log_probs, -20.0, 20.0)
+        coef_1 = torch.exp(log_ratio) # 重要性采样 shape: [batch_size * num_generations, num_actions]
         coef_2 = torch.clamp(coef_1, 1 - self.args.clip_eps, 1 + self.args.clip_eps)
         per_token_loss1 = coef_1 * advantages.unsqueeze(1) # 一个序列中每个token的优势是一样的
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
@@ -306,8 +336,15 @@ class GRPOTrainer:
         if self.args.beta != 0.0:
             per_token_loss = per_token_loss + self.args.beta * k3
         
-        loss = per_token_loss.sum(dim=1) / action_mask.sum(dim=1) # shape: [batch_size * num_generations]
+        # 避免除以零
+        action_mask_sum = action_mask.sum(dim=1).clamp(min=1.0)  # 至少为1避免除零
+        loss = per_token_loss.sum(dim=1) / action_mask_sum # shape: [batch_size * num_generations]
         loss = loss.mean()
+        
+        # 检查loss是否为nan或inf
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: loss is nan or inf, setting to 0")
+            loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
         
         # loss = per_token_loss.sum() / action_mask.sum()
         
@@ -319,9 +356,19 @@ class GRPOTrainer:
         # 计算策略模型输出token的概率
         output = model(input_ids, attention_mask=attention_mask)
         logits = output.logits
+        
+        # 裁剪logits避免极端值
+        logits = torch.clamp(logits, -100.0, 100.0)
+        
         log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
         log_probs_labels = log_probs.gather(dim=-1, index=input_ids[:, 1:].unsqueeze(-1))
         action_log_probs = log_probs_labels.squeeze(-1)[:, -num_actions:]
+        
+        # 检查并处理nan/inf
+        if torch.isnan(action_log_probs).any() or torch.isinf(action_log_probs).any():
+            print(f"Warning: action_log_probs contains nan or inf")
+            action_log_probs = torch.nan_to_num(action_log_probs, nan=-100.0, neginf=-100.0)
+        
         return action_log_probs
 
     
@@ -335,6 +382,9 @@ class GRPOTrainer:
         # loss = scaler.scale(loss)
         loss.backward()
         if (step + 1) % self.args.gradient_accumulation_steps == 0:
+            
+            # 添加梯度裁剪防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.step()
             optimizer.zero_grad()
