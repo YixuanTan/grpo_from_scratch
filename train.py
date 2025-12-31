@@ -51,7 +51,7 @@ class GRPOArguments:
     output_dir = './output'
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     lr = 0.000001
-    save_steps = 100
+    save_steps = 10
     epoch = 3
     num_generations = 4 # 组内样本数
     max_prompt_length = 256 # 最大输入长度
@@ -134,6 +134,9 @@ class GRPOTrainer:
         
         # 模型更新的次数
         self.update_steps = 0 
+
+        self.max_training_step = 20
+
     def get_tokenizer(self, tokenizer):
         tokenizer.padding_side = "left"
         return tokenizer
@@ -419,10 +422,16 @@ class GRPOTrainer:
                         if self.update_steps % self.args.save_steps == 0:
                             self.model.save_pretrained(self.args.output_dir + f'/checkpoint_{self.update_steps}')
                             self.tokenizer.save_pretrained(self.args.output_dir + f'/checkpoint_{self.update_steps}')
+                        if self.update_steps > self.max_training_step:
+                            break
                 
                 # 清理缓存，防止内存泄漏
                 del inputs
                 torch.cuda.empty_cache()
+
+                if self.update_steps > self.max_training_step:
+                    return
+
     def save_model(self):
         self.model.save_pretrained(self.args.output_dir)
         self.tokenizer.save_pretrained(self.args.output_dir)           
